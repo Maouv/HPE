@@ -301,12 +301,17 @@ async def handle_extension_message(msg: dict):
 
     if msg_type == 'cdp_response':
         rid = msg.get('id')
+        err = msg.get('error')
+        has_result = msg.get('result') is not None
+        log.info(f'CDP response: id={rid} error={err} has_result={has_result}')
         future = state.pending_cdp.pop(rid, None)
         if future and not future.done():
-            if msg.get('error'):
-                future.set_exception(Exception(msg['error']))
+            if err:
+                future.set_exception(Exception(err))
             else:
                 future.set_result(msg.get('result'))
+        else:
+            log.warning(f'CDP response for unknown/expired id={rid}')
         return
 
     if msg_type == 'cdp_event':
@@ -496,11 +501,23 @@ async def browser_cdp_websocket(ws: WebSocket):
                 sess = state.sessions[session_id]
                 tab_id = sess['tabId']
 
+                # Short-circuit: respond to noop-ish commands without hitting extension
+                if method in ('Target.setAutoAttach', 'Target.setDiscoverTargets',
+                               'Log.enable', 'Log.disable', 'Log.startViolationsReport',
+                               'Log.stopViolationsReport'):
+                    await ws.send_text(json.dumps({
+                        'id': cdp_id,
+                        'sessionId': session_id,
+                        'result': {},
+                    }))
+                    continue
+
                 rid = state.next_id()
                 future = asyncio.get_event_loop().create_future()
                 state.pending_cdp[rid] = future
 
                 if state.extension_ws:
+                    log.info(f'Fwd CDP→ext: id={rid} method={method} tab={tab_id} session={session_id}')
                     await state.extension_ws.send_json({
                         'type': 'cdp_command',
                         'id': rid,
