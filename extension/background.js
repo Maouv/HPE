@@ -222,6 +222,7 @@ async function handleCdpCommand(msg) {
   try {
     // Ensure tab is attached
     if (!STATE.attachedTabs.has(tabId)) {
+      console.log('[HPE] Tab not attached, attaching now:', tabId);
       await attachDebugger(tabId);
     }
 
@@ -233,8 +234,10 @@ async function handleCdpCommand(msg) {
         params || {},
         (result) => {
           if (chrome.runtime.lastError) {
+            console.log('[HPE] sendCommand FAILED:', id, method, chrome.runtime.lastError.message);
             reject(new Error(chrome.runtime.lastError.message));
           } else {
+            console.log('[HPE] sendCommand OK:', id, method);
             resolve(result);
           }
         }
@@ -359,6 +362,7 @@ async function attachDebugger(tabId) {
   await new Promise((resolve, reject) => {
     chrome.debugger.attach({ tabId: tabId }, '1.3', () => {
       if (chrome.runtime.lastError) {
+        console.log('[HPE] Attach FAILED:', tabId, chrome.runtime.lastError.message);
         reject(new Error(chrome.runtime.lastError.message));
       } else {
         STATE.attachedTabs.set(tabId, { url: '', title: '' });
@@ -390,6 +394,7 @@ async function detachDebugger(tabId) {
 // ─── CDP Event Forwarding ───────────────────────────────────────────────────
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  console.log('[HPE] CDP event:', method, 'tab:', source.tabId, 'params keys:', params ? Object.keys(params).join(',') : 'none');
   // Forward CDP events ke gateway (Page.frameNavigated, Runtime.consoleAPICalled, dll)
   sendToGateway({
     type: 'cdp_event',
