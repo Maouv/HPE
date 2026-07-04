@@ -50,6 +50,12 @@ class GatewayState:
         # Pending CDP commands: request_id → Future
         self.pending_cdp: Dict[int, asyncio.Future] = {}
 
+        # Session mapping: sessionId → {tabId, ws (playwright client)}
+        self.sessions: Dict[str, dict] = {}
+
+        # Reverse: tabId → set of sessionIds
+        self.tab_sessions: Dict[int, set] = {}
+
         # Pending tab creation: request_id → Future
         self.pending_create_tab: Dict[int, asyncio.Future] = {}
 
@@ -105,6 +111,10 @@ async def json_list(request: Request):
     host = request.headers.get('host', f'localhost:8765')
     targets = []
     for tab in state.tabs:
+        tab_url = tab.get('url', '')
+        # Skip non-debuggable tabs
+        if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+            continue
         tid = str(tab['id'])
         targets.append({
             'description': '',
@@ -436,10 +446,37 @@ async def cdp_client_websocket(ws: WebSocket, tab_id: int):
 async def browser_cdp_websocket(ws: WebSocket):
     """
     Browser-level CDP endpoint.
-    Playwright may connect here first to get Target.createTarget etc.
+    Handles Playwright connect_over_cdp flow with session routing.
     """
     await ws.accept()
     log.info('Browser CDP client connected')
+
+    # Request fresh tab list from extension before sending targets
+    if state.extension_ws:
+        await state.extension_ws.send_json({'type': 'get_tabs'})
+        # Wait briefly for fresh tab list
+        await asyncio.sleep(0.3)
+
+    # On connect: send targetCreated events for all existing tabs
+    # Skip tabs with content:// or chrome:// URLs — extension can't debug them
+    for tab in state.tabs:
+        tab_url = tab.get('url', '')
+        if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+            continue
+        await ws.send_text(json.dumps({
+            'method': 'Target.targetCreated',
+            'params': {
+                'targetInfo': {
+                    'targetId': str(tab['id']),
+                    'type': 'page',
+                    'title': tab.get('title', ''),
+                    'url': tab.get('url', ''),
+                    'attached': False,
+                    'browserId': 'HPE-Bridge',
+                    'browserContextId': 'default',
+                }
+            }
+        }))
 
     try:
         while True:
@@ -449,11 +486,62 @@ async def browser_cdp_websocket(ws: WebSocket):
             cdp_id = msg.get('id')
             method = msg.get('method')
             params = msg.get('params', {})
+            session_id = msg.get('sessionId')
+
+            log.info(f'CDP msg: method={method} id={cdp_id} session={session_id}')
+
+            # ── Session-routed commands ──
+            # If message has sessionId, forward to extension as CDP command
+            if session_id and session_id in state.sessions:
+                sess = state.sessions[session_id]
+                tab_id = sess['tabId']
+
+                rid = state.next_id()
+                future = asyncio.get_event_loop().create_future()
+                state.pending_cdp[rid] = future
+
+                if state.extension_ws:
+                    await state.extension_ws.send_json({
+                        'type': 'cdp_command',
+                        'id': rid,
+                        'method': method,
+                        'params': params,
+                        'tabId': tab_id,
+                    })
+                    try:
+                        result = await asyncio.wait_for(future, timeout=30.0)
+                        await ws.send_text(json.dumps({
+                            'id': cdp_id,
+                            'sessionId': session_id,
+                            'result': result if result is not None else {},
+                        }))
+                    except asyncio.TimeoutError:
+                        await ws.send_text(json.dumps({
+                            'id': cdp_id,
+                            'sessionId': session_id,
+                            'error': {'message': 'CDP command timeout'},
+                        }))
+                    except Exception as e:
+                        # Tab might be closed — send error, don't crash WS
+                        log.warning(f'CDP command failed for tab {tab_id}: {e}')
+                        await ws.send_text(json.dumps({
+                            'id': cdp_id,
+                            'sessionId': session_id,
+                            'error': {'message': str(e)},
+                        }))
+                else:
+                    await ws.send_text(json.dumps({
+                        'id': cdp_id,
+                        'sessionId': session_id,
+                        'error': {'message': 'Extension not connected'},
+                    }))
+                continue
 
             if not method:
                 continue
 
-            # Handle browser-level CDP methods
+            # ── Browser-level methods ──
+
             if method == 'Browser.getVersion':
                 await ws.send_text(json.dumps({
                     'id': cdp_id,
@@ -466,56 +554,82 @@ async def browser_cdp_websocket(ws: WebSocket):
                     },
                 }))
 
-            elif method == 'Target.createTarget':
-                # Create new tab
-                url = params.get('url', 'about:blank')
-                rid = state.next_id()
-                future = asyncio.get_event_loop().create_future()
-                state.pending_create_tab[rid] = future
+            elif method == 'Target.createBrowserContext':
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {'browserContextId': 'default'},
+                }))
 
-                if state.extension_ws:
-                    await state.extension_ws.send_json({
-                        'type': 'create_tab',
-                        'id': rid,
-                        'url': url,
-                    })
+            elif method == 'Target.disposeBrowserContext':
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {},
+                }))
 
-                    try:
-                        result = await asyncio.wait_for(future, timeout=10.0)
-                        tab = result['tab']
-                        # Send Target.targetCreated event
-                        await ws.send_text(json.dumps({
-                            'method': 'Target.targetCreated',
-                            'params': {
-                                'targetInfo': {
-                                    'targetId': str(tab['id']),
-                                    'type': 'page',
-                                    'title': tab.get('title', ''),
-                                    'url': tab.get('url', url),
-                                    'attached': False,
-                                    'browserId': 'HPE-Bridge',
-                                    'browserContextId': 'default',
-                                }
-                            }
-                        }))
-                        # Send response
-                        await ws.send_text(json.dumps({
-                            'id': cdp_id,
-                            'result': {'targetId': str(tab['id'])},
-                        }))
-                    except asyncio.TimeoutError:
-                        await ws.send_text(json.dumps({
-                            'id': cdp_id,
-                            'error': {'message': 'Tab creation timeout'},
-                        }))
-                else:
+            elif method == 'Target.setDiscoverTargets':
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {},
+                }))
+
+            elif method == 'Target.setAutoAttach':
+                # Playwright auto-attach — auto-attach to all debuggable tabs
+                for tab in state.tabs:
+                    tab_url = tab.get('url', '')
+                    if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+                        continue
+                    tab_id = tab['id']
+                    sid = f'session-{tab_id}-{state.next_id()}'
+                    state.sessions[sid] = {'tabId': tab_id, 'ws': ws}
+                    if tab_id not in state.tab_sessions:
+                        state.tab_sessions[tab_id] = set()
+                    state.tab_sessions[tab_id].add(sid)
+
                     await ws.send_text(json.dumps({
-                        'id': cdp_id,
-                        'error': {'message': 'Extension not connected'},
+                        'method': 'Target.attachedToTarget',
+                        'params': {
+                            'sessionId': sid,
+                            'targetInfo': {
+                                'targetId': str(tab_id),
+                                'type': 'page',
+                                'title': tab.get('title', ''),
+                                'url': tab.get('url', ''),
+                                'attached': True,
+                                'browserId': 'HPE-Bridge',
+                                'browserContextId': 'default',
+                            },
+                        }
                     }))
 
+                # Acknowledge
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {},
+                }))
+
+            elif method == 'Browser.setDownloadBehavior':
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {},
+                }))
+
+            elif method == 'Target.getTargetInfo':
+                await ws.send_text(json.dumps({
+                    'id': cdp_id,
+                    'result': {
+                        'targetInfo': {
+                            'targetId': 'HPE-Bridge',
+                            'type': 'browser',
+                            'title': '',
+                            'url': '',
+                            'attached': True,
+                            'browserId': 'HPE-Bridge',
+                            'browserContextId': 'default',
+                        }
+                    },
+                }))
+
             elif method == 'Target.getTargets':
-                # List all targets
                 targets = []
                 for tab in state.tabs:
                     targets.append({
@@ -532,50 +646,97 @@ async def browser_cdp_websocket(ws: WebSocket):
                     'result': {'targetInfos': targets},
                 }))
 
-            elif method == 'Target.setDiscoverTargets':
-                # Acknowledge
-                await ws.send_text(json.dumps({
-                    'id': cdp_id,
-                    'result': {},
-                }))
-
-            elif method == 'Target.setAutoAttach':
-                # Playwright auto-attach — acknowledge, we handle attach per-tab
-                await ws.send_text(json.dumps({
-                    'id': cdp_id,
-                    'result': {},
-                }))
-
-            elif method == 'Browser.setDownloadBehavior':
-                await ws.send_text(json.dumps({
-                    'id': cdp_id,
-                    'result': {},
-                }))
-
-            elif method == 'Target.getTargetInfo':
-                # Return browser target info
-                await ws.send_text(json.dumps({
-                    'id': cdp_id,
-                    'result': {
-                        'targetInfo': {
-                            'targetId': 'HPE-Bridge',
-                            'type': 'browser',
-                            'title': '',
-                            'url': '',
-                            'attached': True,
-                            'browserId': 'HPE-Bridge',
-                            'browserContextId': 'default',
-                        }
-                    },
-                }))
-
             elif method == 'Target.attachToTarget':
-                # Playwright wants to attach to a target
+                # Attach to specific target — return sessionId
                 target_id = params.get('targetId')
+                try:
+                    tid = int(target_id)
+                except (ValueError, TypeError):
+                    tid = target_id
+
+                sid = f'session-{tid}-{state.next_id()}'
+                state.sessions[sid] = {'tabId': tid, 'ws': ws}
+                if tid not in state.tab_sessions:
+                    state.tab_sessions[tid] = set()
+                state.tab_sessions[tid].add(sid)
+
                 await ws.send_text(json.dumps({
                     'id': cdp_id,
-                    'result': {'sessionId': f'session-{target_id}'},
+                    'result': {'sessionId': sid},
                 }))
+
+            elif method == 'Target.createTarget':
+                # Create new tab
+                url = params.get('url', 'about:blank')
+                rid = state.next_id()
+                future = asyncio.get_event_loop().create_future()
+                state.pending_create_tab[rid] = future
+
+                if state.extension_ws:
+                    await state.extension_ws.send_json({
+                        'type': 'create_tab',
+                        'id': rid,
+                        'url': url,
+                    })
+                    try:
+                        result = await asyncio.wait_for(future, timeout=10.0)
+                        tab = result['tab']
+                        tid = tab['id']
+
+                        # Send targetCreated event
+                        await ws.send_text(json.dumps({
+                            'method': 'Target.targetCreated',
+                            'params': {
+                                'targetInfo': {
+                                    'targetId': str(tid),
+                                    'type': 'page',
+                                    'title': tab.get('title', ''),
+                                    'url': tab.get('url', url),
+                                    'attached': False,
+                                    'browserId': 'HPE-Bridge',
+                                    'browserContextId': 'default',
+                                }
+                            }
+                        }))
+
+                        # Auto-attach to the new tab
+                        sid = f'session-{tid}-{state.next_id()}'
+                        state.sessions[sid] = {'tabId': tid, 'ws': ws}
+                        if tid not in state.tab_sessions:
+                            state.tab_sessions[tid] = set()
+                        state.tab_sessions[tid].add(sid)
+
+                        await ws.send_text(json.dumps({
+                            'method': 'Target.attachedToTarget',
+                            'params': {
+                                'sessionId': sid,
+                                'targetInfo': {
+                                    'targetId': str(tid),
+                                    'type': 'page',
+                                    'title': tab.get('title', ''),
+                                    'url': tab.get('url', url),
+                                    'attached': True,
+                                    'browserId': 'HPE-Bridge',
+                                    'browserContextId': 'default',
+                                },
+                            }
+                        }))
+
+                        # Send response
+                        await ws.send_text(json.dumps({
+                            'id': cdp_id,
+                            'result': {'targetId': str(tid)},
+                        }))
+                    except asyncio.TimeoutError:
+                        await ws.send_text(json.dumps({
+                            'id': cdp_id,
+                            'error': {'message': 'Tab creation timeout'},
+                        }))
+                else:
+                    await ws.send_text(json.dumps({
+                        'id': cdp_id,
+                        'error': {'message': 'Extension not connected'},
+                    }))
 
             elif method == 'Target.closeTarget':
                 target_id = params.get('targetId')
@@ -618,30 +779,45 @@ async def browser_cdp_websocket(ws: WebSocket):
         log.info('Browser CDP client disconnected')
     except Exception as e:
         log.error(f'Browser CDP WS error: {e}')
+    finally:
+        # Clean up sessions belonging to this ws
+        to_remove = [sid for sid, s in state.sessions.items() if s['ws'] is ws]
+        for sid in to_remove:
+            sess = state.sessions.pop(sid, None)
+            if sess:
+                tid = sess['tabId']
+                if tid in state.tab_sessions:
+                    state.tab_sessions[tid].discard(sid)
+                    if not state.tab_sessions[tid]:
+                        del state.tab_sessions[tid]
 
 
 # ─── CDP Event Broadcast ────────────────────────────────────────────────────
 
 async def broadcast_cdp_event(tab_id: int, method: str, params: dict):
-    """Broadcast CDP event to all Playwright clients for a tab."""
-    clients = state.cdp_clients.get(tab_id, set())
-    if not clients:
+    """Broadcast CDP event to Playwright clients via session routing."""
+    # Route via sessions
+    sids = state.tab_sessions.get(tab_id, set())
+    if not sids:
         return
 
-    msg = json.dumps({
-        'method': method,
-        'params': params,
-    })
-
     dead = []
-    for ws in clients:
+    for sid in list(sids):
+        sess = state.sessions.get(sid)
+        if not sess:
+            continue
+        ws = sess['ws']
         try:
-            await ws.send_text(msg)
+            await ws.send_text(json.dumps({
+                'method': method,
+                'params': params,
+                'sessionId': sid,
+            }))
         except Exception:
-            dead.append(ws)
+            dead.append(sid)
 
-    for ws in dead:
-        clients.discard(ws)
+    for sid in dead:
+        sids.discard(sid)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
