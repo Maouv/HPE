@@ -63,8 +63,15 @@ function connect(gatewayUrl, password) {
   STATE.gatewayUrl = gatewayUrl;
   STATE.password = password || '';
 
+  // Normalize URL: http→ws, https→wss, append /ws
+  let url = gatewayUrl.trim().replace(/\/+$/, '');
+  url = url.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
+  if (!url.endsWith('/ws')) {
+    url = url + '/ws';
+  }
+
   try {
-    const ws = new WebSocket(gatewayUrl);
+    const ws = new WebSocket(url);
     STATE.ws = ws;
 
     ws.onopen = () => {
