@@ -433,11 +433,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 });
 
+chrome.tabs.onCreated.addListener((tab) => {
+  console.log('[HPE] Tab created:', tab.id, tab.url);
+  // Refresh tab list to gateway
+  sendTabList();
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (STATE.attachedTabs.has(tabId)) {
-    STATE.attachedTabs.delete(tabId);
-    sendToGateway({ type: 'tab_removed', tabId: tabId });
-  }
+  console.log('[HPE] Tab removed:', tabId);
+  STATE.attachedTabs.delete(tabId);
+  sendToGateway({ type: 'tab_removed', tabId: tabId });
+  sendTabList();
 });
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

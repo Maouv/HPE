@@ -113,7 +113,7 @@ async def json_list(request: Request):
     for tab in state.tabs:
         tab_url = tab.get('url', '')
         # Skip non-debuggable tabs
-        if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+        if tab_url.startswith(('content://', 'chrome://', 'chrome-extension://', 'devtools://')):
             continue
         tid = str(tab['id'])
         targets.append({
@@ -262,6 +262,8 @@ async def handle_extension_message(msg: dict):
     if msg_type == 'tab_list':
         state.tabs = msg.get('tabs', [])
         log.info(f'Received tab list: {len(state.tabs)} tabs')
+        for t in state.tabs:
+            log.info(f'  tab: id={t.get("id")} url={t.get("url","")[:80]}')
         return
 
     if msg_type == 'create_tab_response':
@@ -303,7 +305,7 @@ async def handle_extension_message(msg: dict):
         rid = msg.get('id')
         err = msg.get('error')
         has_result = msg.get('result') is not None
-        log.info(f'CDP response: id={rid} error={err} has_result={has_result}')
+        log.info(f'CDP response: id={rid} error={err} has_result={has_result} result_keys={list(msg.get("result", {}).keys()) if has_result else []}')
         future = state.pending_cdp.pop(rid, None)
         if future and not future.done():
             if err:
@@ -463,10 +465,11 @@ async def browser_cdp_websocket(ws: WebSocket):
         await asyncio.sleep(0.3)
 
     # On connect: send targetCreated events for all existing tabs
-    # Skip tabs with content:// or chrome:// URLs — extension can't debug them
+    # Skip tabs with non-debuggable URLs — extension can't access them
+    SKIP_PREFIXES = ('content://', 'chrome://', 'chrome-extension://', 'devtools://')
     for tab in state.tabs:
         tab_url = tab.get('url', '')
-        if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+        if tab_url.startswith(SKIP_PREFIXES):
             continue
         await ws.send_text(json.dumps({
             'method': 'Target.targetCreated',
@@ -532,6 +535,124 @@ async def browser_cdp_websocket(ws: WebSocket):
                             'sessionId': session_id,
                             'result': result if result is not None else {},
                         }))
+
+                        # ── Synthesize CDP events that Mises doesn't fire ──
+                        # Mises chrome.debugger.onEvent doesn't fire, so we fake
+                        # the events Playwright needs to consider a page "ready"
+                        if method == 'Page.getFrameTree' and result:
+                            frame_tree = result.get('frameTree', {})
+                            frame = frame_tree.get('frame', {})
+                            frame_id = frame.get('id', '')
+                            loader_id = frame.get('loaderId', f'loader-{tab_id}')
+                            log.info(f'Frame tree: frame={json.dumps(frame)[:200]}')
+                            # Store for later use
+                            sess['frameId'] = frame_id
+                            sess['loaderId'] = loader_id
+                            # Page.frameStartedLoading
+                            await ws.send_text(json.dumps({
+                                'method': 'Page.frameStartedLoading',
+                                'params': {'frameId': frame_id},
+                                'sessionId': session_id,
+                            }))
+                            # Page.frameNavigated
+                            await ws.send_text(json.dumps({
+                                'method': 'Page.frameNavigated',
+                                'params': {'frame': frame, 'type': 'Navigation'},
+                                'sessionId': session_id,
+                            }))
+                            log.info(f'Synthesized Page.frameNavigated: frameId={frame_id}')
+
+                        elif method == 'Runtime.enable':
+                            # Runtime.executionContextCreated — use stored frameId
+                            fid = sess.get('frameId', '')
+                            await ws.send_text(json.dumps({
+                                'method': 'Runtime.executionContextCreated',
+                                'params': {
+                                    'context': {
+                                        'id': 1,
+                                        'origin': '',
+                                        'name': '',
+                                        'auxData': {
+                                            'frameId': fid,
+                                            'isDefault': True,
+                                        },
+                                    },
+                                },
+                                'sessionId': session_id,
+                            }))
+                            log.info(f'Synthesized Runtime.executionContextCreated: frameId={fid}')
+
+                        elif method == 'Page.setLifecycleEventsEnabled':
+                            fid = sess.get('frameId', '')
+                            lid = sess.get('loaderId', f'loader-{tab_id}')
+                            # Emit full lifecycle: DOMContentLoaded → load
+                            for evt in ('init', 'DOMContentLoaded', 'load'):
+                                await ws.send_text(json.dumps({
+                                    'method': 'Page.lifecycleEvent',
+                                    'params': {
+                                        'frameId': fid,
+                                        'loaderId': lid,
+                                        'name': evt,
+                                    },
+                                    'sessionId': session_id,
+                                }))
+                            # Page.frameStoppedLoading
+                            await ws.send_text(json.dumps({
+                                'method': 'Page.frameStoppedLoading',
+                                'params': {'frameId': fid},
+                                'sessionId': session_id,
+                            }))
+                            log.info(f'Synthesized Page.lifecycle + frameStoppedLoading: frameId={fid}')
+
+                        elif method == 'Page.navigate' and result:
+                            fid = sess.get('frameId', '')
+                            new_lid = result.get('loaderId', f'loader-{tab_id}-{state.next_id()}')
+                            sess['loaderId'] = new_lid
+                            # Playwright waits for Page.frameNavigated + lifecycle after navigate
+                            await ws.send_text(json.dumps({
+                                'method': 'Page.frameNavigated',
+                                'params': {
+                                    'frame': {
+                                        'id': fid,
+                                        'loaderId': new_lid,
+                                        'url': params.get('url', ''),
+                                        'domainAndRegistry': '',
+                                        'securityOrigin': '',
+                                        'mimeType': 'text/html',
+                                        'secureContextType': 'Secure',
+                                        'crossOriginIsolatedContextType': 'NotIsolated',
+                                        'gatedAPIFeatures': [],
+                                    },
+                                },
+                                'sessionId': session_id,
+                            }))
+                            for evt in ('init', 'DOMContentLoaded', 'load'):
+                                await ws.send_text(json.dumps({
+                                    'method': 'Page.lifecycleEvent',
+                                    'params': {
+                                        'frameId': fid,
+                                        'loaderId': new_lid,
+                                        'name': evt,
+                                    },
+                                    'sessionId': session_id,
+                                }))
+                            log.info(f'Synthesized Page.navigate events: frameId={fid} loaderId={new_lid}')
+
+                        elif method == 'Page.setDocumentContent':
+                            # set_content uses this internally — emit load lifecycle
+                            fid = sess.get('frameId', '')
+                            lid = sess.get('loaderId', f'loader-{tab_id}')
+                            for evt in ('DOMContentLoaded', 'load'):
+                                await ws.send_text(json.dumps({
+                                    'method': 'Page.lifecycleEvent',
+                                    'params': {
+                                        'frameId': fid,
+                                        'loaderId': lid,
+                                        'name': evt,
+                                    },
+                                    'sessionId': session_id,
+                                }))
+                            log.info(f'Synthesized Page.setDocumentContent lifecycle: frameId={fid}')
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
                             'id': cdp_id,
@@ -591,9 +712,10 @@ async def browser_cdp_websocket(ws: WebSocket):
 
             elif method == 'Target.setAutoAttach':
                 # Playwright auto-attach — auto-attach to all debuggable tabs
+                SKIP_PREFIXES = ('content://', 'chrome://', 'chrome-extension://', 'devtools://')
                 for tab in state.tabs:
                     tab_url = tab.get('url', '')
-                    if tab_url.startswith('content://') or tab_url.startswith('chrome://') or tab_url.startswith('chrome-extension://'):
+                    if tab_url.startswith(SKIP_PREFIXES):
                         continue
                     tab_id = tab['id']
                     sid = f'session-{tab_id}-{state.next_id()}'
@@ -645,6 +767,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                         }
                     },
                 }))
+                log.info('Target.getTargetInfo response sent')
 
             elif method == 'Target.getTargets':
                 targets = []
