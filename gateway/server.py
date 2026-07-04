@@ -523,9 +523,14 @@ async def browser_cdp_websocket(ws: WebSocket):
 
     # Request fresh tab list from extension before sending targets
     if state.extension_ws:
-        await state.extension_ws.send_json({'type': 'get_tabs'})
-        # Wait briefly for fresh tab list
-        await asyncio.sleep(0.3)
+        try:
+            await state.extension_ws.send_json({'type': 'get_tabs'})
+            # Wait briefly for fresh tab list
+            await asyncio.sleep(0.3)
+        except Exception:
+            log.warning('Extension disconnected, cannot get fresh tab list')
+            state.extension_ws = None
+            state.extension_connected.clear()
 
     # On connect: send targetCreated events for all existing tabs
     # Skip tabs with non-debuggable URLs — extension can't access them
@@ -615,135 +620,9 @@ async def browser_cdp_websocket(ws: WebSocket):
                             'result': result if result is not None else {},
                         }))
 
-                        # ── Synthetic events — safety net for Android ──
-                        # Wake-up Runtime.enable in attachDebugger() primes the
-                        # onEvent pipeline, but initial events fire BEFORE
-                        # Playwright connects → lost. These synthetic events
-                        # ensure Playwright completes init.
-                        # If real onEvent events also arrive → Playwright handles
-                        # idempotently (duplicate contextId → update, not crash).
-
-                        if method == 'Runtime.enable':
-                            fi = sess.get('frame_info', {})
-                            fid = fi.get('id', '1')
-                            origin = fi.get('url', 'about:blank')
-                            sess['ctx_counter'] = 1  # track fake context ids per session
-                            await asyncio.sleep(0.05)
-                            await ws.send_text(json.dumps({
-                                'method': 'Runtime.executionContextCreated',
-                                'params': {
-                                    'context': {
-                                        'id': 1,
-                                        'origin': origin,
-                                        'name': '',
-                                        'auxData': {
-                                            'frameId': fid,
-                                            'isDefault': True,
-                                        },
-                                    }
-                                },
-                                'sessionId': session_id,
-                            }))
-                            log.info(f'[SYNTH] executionContextCreated (init): frame={fid} ctx=1')
-
-                        elif method == 'Page.setLifecycleEventsEnabled':
-                            fi = sess.get('frame_info', {})
-                            fid = fi.get('id', '1')
-                            lid = fi.get('loaderId', '1')
-                            ts = time.time()
-                            await asyncio.sleep(0.05)
-                            for evt in ('DOMContentLoaded', 'load'):
-                                await ws.send_text(json.dumps({
-                                    'method': 'Page.lifecycleEvent',
-                                    'params': {
-                                        'frameId': fid,
-                                        'loaderId': lid,
-                                        'name': evt,
-                                        'timestamp': ts,
-                                    },
-                                    'sessionId': session_id,
-                                }))
-                            log.info(f'[SYNTH] lifecycleEvent (init): frame={fid} loader={lid}')
-
-                        # ── NEW: hook real navigations, not just init ──
-                        # Without this, page.goto() called *after* connect (i.e. every
-                        # actual use of this tool, see test_goto.py step 5) still hangs:
-                        # the init hooks above only fire once, at attach time. A real
-                        # Page.navigate has its own new loaderId/frameId and Playwright
-                        # waits on lifecycle/frameNavigated events keyed to THAT loaderId,
-                        # which nothing was synthesizing before this patch.
-                        #
-                        # CAVEAT (unresolved): executionContextId below is still a fake,
-                        # locally-incrementing counter, NOT a real V8 context id from
-                        # Chromium. If Runtime.evaluate/callFunctionOn is later sent by
-                        # Playwright using this fake id, chrome.debugger.sendCommand will
-                        # forward it verbatim to the real backend, which will very likely
-                        # reject it ("Cannot find context with specified id"). This patch
-                        # does NOT fix page.evaluate() / set_content() (test_goto.py steps
-                        # 7-10) — only unblocks goto()'s navigation-wait. Expect step 5 to
-                        # pass and steps 7/9 to still fail unless real onEvent turns out to
-                        # fire after all (check logs for "cdp_event RECEIVED from extension"
-                        # — if that line NEVER appears during this run, onEvent is
-                        # confirmed dead on this platform, not just slow).
-                        elif method == 'Page.navigate' and result:
-                            fid = result.get('frameId') or sess.get('frame_info', {}).get('id', '1')
-                            lid = result.get('loaderId', '1')
-                            nav_url = params.get('url', '')
-                            nav_error = result.get('errorText')
-
-                            sess['frame_info'] = {'id': fid, 'url': nav_url, 'loaderId': lid}
-                            sess['ctx_counter'] = sess.get('ctx_counter', 1) + 1
-                            new_ctx_id = sess['ctx_counter']
-                            ts = time.time()
-
-                            if nav_error:
-                                # Navigation itself failed at the CDP level — don't
-                                # synthesize a fake success, that would desync Playwright
-                                # further. Let the real error surface via the command result.
-                                log.warning(f'[SYNTH] Page.navigate returned errorText={nav_error}, skipping synthetic events for frame={fid}')
-                            else:
-                                await asyncio.sleep(0.05)
-                                await ws.send_text(json.dumps({
-                                    'method': 'Page.frameNavigated',
-                                    'params': {
-                                        'frame': {
-                                            'id': fid,
-                                            'loaderId': lid,
-                                            'url': nav_url,
-                                            'securityOrigin': nav_url,
-                                            'mimeType': 'text/html',
-                                        },
-                                        'type': 'Navigation',
-                                    },
-                                    'sessionId': session_id,
-                                }))
-                                await ws.send_text(json.dumps({
-                                    'method': 'Runtime.executionContextCreated',
-                                    'params': {
-                                        'context': {
-                                            'id': new_ctx_id,
-                                            'origin': nav_url,
-                                            'name': '',
-                                            'auxData': {
-                                                'frameId': fid,
-                                                'isDefault': True,
-                                            },
-                                        }
-                                    },
-                                    'sessionId': session_id,
-                                }))
-                                for evt in ('DOMContentLoaded', 'load'):
-                                    await ws.send_text(json.dumps({
-                                        'method': 'Page.lifecycleEvent',
-                                        'params': {
-                                            'frameId': fid,
-                                            'loaderId': lid,
-                                            'name': evt,
-                                            'timestamp': ts,
-                                        },
-                                        'sessionId': session_id,
-                                    }))
-                                log.info(f'[SYNTH] frameNavigated+context+lifecycle for real Page.navigate: frame={fid} loader={lid} ctx={new_ctx_id} url={nav_url[:80]}')
+                        # Synthetic events REMOVED — onEvent now fires in Mises.
+                        # Real CDP events flow through broadcast_cdp_event().
+                        # Synthetic injection was causing fake context IDs → V8 reject.
 
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
