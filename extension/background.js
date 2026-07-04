@@ -365,12 +365,34 @@ async function attachDebugger(tabId) {
         console.log('[HPE] Attach FAILED:', tabId, chrome.runtime.lastError.message);
         reject(new Error(chrome.runtime.lastError.message));
       } else {
-        STATE.attachedTabs.set(tabId, { url: '', title: '' });
         console.log('[HPE] Debugger attached:', tabId);
         resolve();
       }
     });
   });
+
+  // WAKE-UP: Android Chromium needs a "dummy" command after attach
+  // to fully activate the debugger event pipeline.
+  // Without this, onEvent never fires on Mises/Kiwi (Android).
+  // Runtime.enable is lightweight and primes the event dispatch.
+  console.log('[HPE] Wake-up: sending Runtime.enable to', tabId);
+  await new Promise((resolve) => {
+    chrome.debugger.sendCommand(
+      { tabId: tabId },
+      'Runtime.enable',
+      {},
+      () => {
+        if (chrome.runtime.lastError) {
+          console.log('[HPE] Wake-up Runtime.enable error (non-fatal):', chrome.runtime.lastError.message);
+        } else {
+          console.log('[HPE] Wake-up Runtime.enable OK:', tabId);
+        }
+        resolve(); // resolve regardless — wake-up is best-effort
+      }
+    );
+  });
+
+  STATE.attachedTabs.set(tabId, { url: '', title: '' });
 }
 
 async function detachDebugger(tabId) {

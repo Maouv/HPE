@@ -530,118 +530,63 @@ async def browser_cdp_websocket(ws: WebSocket):
                     })
                     try:
                         result = await asyncio.wait_for(future, timeout=30.0)
+                        # Log key responses for debugging
+                        if method in ('Page.getFrameTree', 'Runtime.enable'):
+                            log.info(f'CDP response detail: method={method} result={json.dumps(result)[:500]}')
+
+                        # Capture frame info from getFrameTree response
+                        if method == 'Page.getFrameTree' and result:
+                            frame = result.get('frameTree', {}).get('frame', {})
+                            if frame.get('id'):
+                                sess['frame_info'] = {
+                                    'id': frame['id'],
+                                    'url': frame.get('url', ''),
+                                    'loaderId': frame.get('loaderId', '1'),
+                                }
+                                log.info(f'Frame info captured: id={frame["id"]} url={frame.get("url","")[:80]}')
+
                         await ws.send_text(json.dumps({
                             'id': cdp_id,
                             'sessionId': session_id,
                             'result': result if result is not None else {},
                         }))
 
-                        # ── Synthesize CDP events that Mises doesn't fire ──
-                        # Mises chrome.debugger.onEvent doesn't fire, so we fake
-                        # the events Playwright needs to consider a page "ready"
-                        if method == 'Page.getFrameTree' and result:
-                            frame_tree = result.get('frameTree', {})
-                            frame = frame_tree.get('frame', {})
-                            frame_id = frame.get('id', '')
-                            loader_id = frame.get('loaderId', f'loader-{tab_id}')
-                            log.info(f'Frame tree: frame={json.dumps(frame)[:200]}')
-                            # Store for later use
-                            sess['frameId'] = frame_id
-                            sess['loaderId'] = loader_id
-                            # Page.frameStartedLoading
-                            await ws.send_text(json.dumps({
-                                'method': 'Page.frameStartedLoading',
-                                'params': {'frameId': frame_id},
-                                'sessionId': session_id,
-                            }))
-                            # Page.frameNavigated
-                            await ws.send_text(json.dumps({
-                                'method': 'Page.frameNavigated',
-                                'params': {'frame': frame, 'type': 'Navigation'},
-                                'sessionId': session_id,
-                            }))
-                            log.info(f'Synthesized Page.frameNavigated: frameId={frame_id}')
+                        # ── Synthetic events — safety net for Android ──
+                        # Wake-up Runtime.enable in attachDebugger() primes the
+                        # onEvent pipeline, but initial events fire BEFORE
+                        # Playwright connects → lost. These synthetic events
+                        # ensure Playwright completes init.
+                        # If real onEvent events also arrive → Playwright handles
+                        # idempotently (duplicate contextId → update, not crash).
 
-                        elif method == 'Runtime.enable':
-                            # Runtime.executionContextCreated — use stored frameId
-                            fid = sess.get('frameId', '')
+                        if method == 'Runtime.enable':
+                            fi = sess.get('frame_info', {})
+                            fid = fi.get('id', '1')
+                            origin = fi.get('url', 'about:blank')
+                            await asyncio.sleep(0.05)
                             await ws.send_text(json.dumps({
                                 'method': 'Runtime.executionContextCreated',
                                 'params': {
                                     'context': {
                                         'id': 1,
-                                        'origin': '',
+                                        'origin': origin,
                                         'name': '',
                                         'auxData': {
                                             'frameId': fid,
                                             'isDefault': True,
                                         },
-                                    },
+                                    }
                                 },
                                 'sessionId': session_id,
                             }))
-                            log.info(f'Synthesized Runtime.executionContextCreated: frameId={fid}')
+                            log.info(f'Synthetic executionContextCreated: frame={fid}')
 
                         elif method == 'Page.setLifecycleEventsEnabled':
-                            fid = sess.get('frameId', '')
-                            lid = sess.get('loaderId', f'loader-{tab_id}')
-                            # Emit full lifecycle: DOMContentLoaded → load
-                            for evt in ('init', 'DOMContentLoaded', 'load'):
-                                await ws.send_text(json.dumps({
-                                    'method': 'Page.lifecycleEvent',
-                                    'params': {
-                                        'frameId': fid,
-                                        'loaderId': lid,
-                                        'name': evt,
-                                    },
-                                    'sessionId': session_id,
-                                }))
-                            # Page.frameStoppedLoading
-                            await ws.send_text(json.dumps({
-                                'method': 'Page.frameStoppedLoading',
-                                'params': {'frameId': fid},
-                                'sessionId': session_id,
-                            }))
-                            log.info(f'Synthesized Page.lifecycle + frameStoppedLoading: frameId={fid}')
-
-                        elif method == 'Page.navigate' and result:
-                            fid = sess.get('frameId', '')
-                            new_lid = result.get('loaderId', f'loader-{tab_id}-{state.next_id()}')
-                            sess['loaderId'] = new_lid
-                            # Playwright waits for Page.frameNavigated + lifecycle after navigate
-                            await ws.send_text(json.dumps({
-                                'method': 'Page.frameNavigated',
-                                'params': {
-                                    'frame': {
-                                        'id': fid,
-                                        'loaderId': new_lid,
-                                        'url': params.get('url', ''),
-                                        'domainAndRegistry': '',
-                                        'securityOrigin': '',
-                                        'mimeType': 'text/html',
-                                        'secureContextType': 'Secure',
-                                        'crossOriginIsolatedContextType': 'NotIsolated',
-                                        'gatedAPIFeatures': [],
-                                    },
-                                },
-                                'sessionId': session_id,
-                            }))
-                            for evt in ('init', 'DOMContentLoaded', 'load'):
-                                await ws.send_text(json.dumps({
-                                    'method': 'Page.lifecycleEvent',
-                                    'params': {
-                                        'frameId': fid,
-                                        'loaderId': new_lid,
-                                        'name': evt,
-                                    },
-                                    'sessionId': session_id,
-                                }))
-                            log.info(f'Synthesized Page.navigate events: frameId={fid} loaderId={new_lid}')
-
-                        elif method == 'Page.setDocumentContent':
-                            # set_content uses this internally — emit load lifecycle
-                            fid = sess.get('frameId', '')
-                            lid = sess.get('loaderId', f'loader-{tab_id}')
+                            fi = sess.get('frame_info', {})
+                            fid = fi.get('id', '1')
+                            lid = fi.get('loaderId', '1')
+                            ts = time.time()
+                            await asyncio.sleep(0.05)
                             for evt in ('DOMContentLoaded', 'load'):
                                 await ws.send_text(json.dumps({
                                     'method': 'Page.lifecycleEvent',
@@ -649,10 +594,12 @@ async def browser_cdp_websocket(ws: WebSocket):
                                         'frameId': fid,
                                         'loaderId': lid,
                                         'name': evt,
+                                        'timestamp': ts,
                                     },
                                     'sessionId': session_id,
                                 }))
-                            log.info(f'Synthesized Page.setDocumentContent lifecycle: frameId={fid}')
+                            log.info(f'Synthetic lifecycleEvent: frame={fid} loader={lid}')
+
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
                             'id': cdp_id,
