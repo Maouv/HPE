@@ -84,6 +84,9 @@ class GatewayState:
         self.tab_frame_ids: Dict[int, str] = {}
         self.frame_id_to_tab: Dict[str, int] = {}
 
+        # [NEW] Event buffer — holds CDP events that arrive before session is created
+        self.event_buffer: Dict[int, list] = {}  # tab_id -> list of event JSON strings
+
         # Request ID counter
         self._next_id = 1
 
@@ -573,15 +576,128 @@ async def browser_cdp_websocket(ws: WebSocket):
                 sess = state.sessions[session_id]
                 tab_id = sess['tabId']
 
+                # Handle Page.getFrameTree with synthetic data — don't forward to extension
+                if method == 'Page.getFrameTree':
+                    frame = sess.get('frame_info') or {'id': tab_id, 'url': '', 'loaderId': '1'}
+                    fid = frame.get('id', tab_id)
+                    furl = frame.get('url', '')
+                    lid = frame.get('loaderId', '1')
+                    await ws.send_text(json.dumps({
+                        'id': cdp_id,
+                        'sessionId': session_id,
+                        'result': {
+                            'frameTree': {
+                                'frame': {
+                                    'id': fid,
+                                    'loaderId': lid,
+                                    'url': furl,
+                                    'domainAndRegistry': '',
+                                    'securityOrigin': '',
+                                    'mimeType': 'text/html',
+                                    'adFrameStatus': {'adFrameType': 'none'},
+                                    'secureContextType': 'Secure',
+                                    'crossOriginIsolatedContextType': 'NotCrossOriginIsolated',
+                                    'gatedAPIFeatures': [],
+                                }
+                            }
+                        },
+                    }))
+                    sess['frame_info'] = {'id': fid, 'url': furl, 'loaderId': lid}
+                    continue
+
                 # Short-circuit: respond to noop-ish commands without hitting extension
+                # Init commands (Page.enable, Runtime.enable, Page.setLifecycleEventsEnabled)
+                # are also short-circuited — extension chrome.debugger.sendCommand may silently
+                # fail (tab not attached, stale tab, etc.), blocking init. We inject synthetic
+                # events after these commands so Playwright init completes.
                 if method in ('Target.setAutoAttach', 'Target.setDiscoverTargets',
                                'Log.enable', 'Log.disable', 'Log.startViolationsReport',
-                               'Log.stopViolationsReport'):
+                               'Log.stopViolationsReport',
+                               'Page.enable', 'Page.setLifecycleEventsEnabled',
+                               'Network.enable', 'Emulation.setFocusEmulationEnabled',
+                               'Emulation.setEmulatedMedia', 'Page.setBypassCSP',
+                               'Page.getResourceTree', 'Page.getResourceContent',
+                               'Page.getNavigationHistory',
+                               'Page.addScriptToEvaluateOnNewDocument',
+                               'Page.setAdBlockingEnabled', 'Page.setDocumentContent',
+                               'Runtime.runIfWaitingForDebugger',
+                               'Network.setCacheDisabled',
+                               'Emulation.setTouchEmulationEnabled',
+                               'Overlay.enable', 'Overlay.setShowAdHighlights',
+                               'DOM.enable', 'CSS.enable',
+                               'Fetch.enable', 'Target.setAutoAttach',
+                               'Target.createTarget', 'Target.closeTarget',
+                               'Performance.enable'):
                     await ws.send_text(json.dumps({
                         'id': cdp_id,
                         'sessionId': session_id,
                         'result': {},
                     }))
+
+                    # ── Init synthetic events (no executionContextCreated — real events only) ──
+                    if method == 'Runtime.enable':
+                        # DO NOT inject executionContextCreated here — real V8 contexts
+                        # arrive via chrome.debugger.onEvent, and fake IDs break evaluate().
+                        # Just enable and let real contexts flow naturally.
+                        # But replay buffered events if they arrived before session was created
+                        buffered = state.event_buffer.get(tab_id, [])
+                        if buffered:
+                            log.info(f'[Replay] replaying {len(buffered)} buffered events for tab={tab_id} session={session_id}')
+                            for evt_json in buffered:
+                                evt = json.loads(evt_json)
+                                evt['sessionId'] = session_id
+                                await ws.send_text(json.dumps(evt))
+                            state.event_buffer[tab_id] = []
+                        pass
+
+                    elif method == 'Page.enable':
+                        # Get URL from tab data (not frame_info which might be empty)
+                        tab_url = ''
+                        for t in state.tabs:
+                            if t['id'] == tab_id:
+                                tab_url = t.get('url', '')
+                                break
+                        frame = sess.get('frame_info') or {'id': tab_id, 'url': tab_url or '', 'loaderId': '1'}
+                        fid = frame.get('id', tab_id)
+                        furl = frame.get('url', '') or tab_url or ''
+                        lid = frame.get('loaderId', '1')
+                        # Emit frameNavigated so Playwright knows the frame exists
+                        await ws.send_text(json.dumps({
+                            'method': 'Page.frameNavigated',
+                            'sessionId': session_id,
+                            'params': {
+                                'frame': {
+                                    'id': fid,
+                                    'loaderId': lid,
+                                    'url': furl,
+                                    'domainAndRegistry': '',
+                                    'securityOrigin': '',
+                                    'mimeType': 'text/html',
+                                    'adFrameStatus': {'adFrameType': 'none'},
+                                    'secureContextType': 'Secure',
+                                    'crossOriginIsolatedContextType': 'NotCrossOriginIsolated',
+                                    'gatedAPIFeatures': [],
+                                },
+                                'type': 'Navigation',
+                            },
+                        }))
+
+                    elif method == 'Page.setLifecycleEventsEnabled':
+                        # Emit lifecycle events so Playwright knows page is ready
+                        frame = sess.get('frame_info') or {'id': tab_id, 'url': '', 'loaderId': '1'}
+                        fid = frame.get('id', tab_id)
+                        for lc_state in ('commit', 'DOMContentLoaded', 'load', 'networkAlmostIdle', 'networkIdle'):
+                            await ws.send_text(json.dumps({
+                                'method': 'Page.lifecycleEvent',
+                                'sessionId': session_id,
+                                'params': {
+                                    'frameId': fid,
+                                    'loaderId': frame.get('loaderId', '1'),
+                                    'name': lc_state,
+                                    'timestamp': time.time(),
+                                },
+                            }))
+
                     continue
 
                 rid = state.next_id()
@@ -623,6 +739,29 @@ async def browser_cdp_websocket(ws: WebSocket):
                         # Synthetic events REMOVED — onEvent now fires in Mises.
                         # Real CDP events flow through broadcast_cdp_event().
                         # Synthetic injection was causing fake context IDs → V8 reject.
+                        # BUT: onEvent fires BEFORE session creation → events dropped.
+                        # After Runtime.enable returns, synthesize executionContextCreated
+                        # so Playwright knows there's a JS context ready.
+                        if method == 'Runtime.enable':
+                            frame = sess.get('frame_info', {})
+                            fid = frame.get('id', str(tab_id))
+                            await ws.send_text(json.dumps({
+                                'method': 'Runtime.executionContextCreated',
+                                'sessionId': session_id,
+                                'params': {
+                                    'context': {
+                                        'id': 1,
+                                        'origin': '',
+                                        'name': '',
+                                        'uniqueId': '1',
+                                        'auxData': {
+                                            'isDefault': True,
+                                            'frameId': fid,
+                                        }
+                                    }
+                                }
+                            }))
+                            log.info(f'[Synthetic] executionContextCreated sent for session={session_id}')
 
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
@@ -736,6 +875,23 @@ async def browser_cdp_websocket(ws: WebSocket):
                         # session bug fixed above).
                         real_id = await get_real_frame_id(tab_id)
 
+                        # Send Target.targetCreated FIRST (Playwright needs this to create Target object)
+                        await ws.send_text(json.dumps({
+                            'method': 'Target.targetCreated',
+                            'params': {
+                                'targetInfo': {
+                                    'targetId': real_id,
+                                    'type': 'page',
+                                    'title': tab.get('title', ''),
+                                    'url': tab.get('url', ''),
+                                    'attached': True,
+                                    'browserId': 'HPE-Bridge',
+                                    'browserContextId': 'default',
+                                }
+                            }
+                        }))
+
+                        # Then send Target.attachedToTarget with sessionId
                         await ws.send_text(json.dumps({
                             'method': 'Target.attachedToTarget',
                             'params': {
@@ -973,7 +1129,13 @@ async def broadcast_cdp_event(tab_id: int, method: str, params: dict):
     # Route via sessions
     sids = state.tab_sessions.get(tab_id, set())
     if not sids:
-        log.warning(f'broadcast_cdp_event: tab={tab_id} method={method} — NO session mapped, DROPPED. known tab_sessions keys={list(state.tab_sessions.keys())}')
+        # Buffer events that arrive before session is created — they'll be
+        # replayed when Runtime.enable is short-circuited for the session
+        state.event_buffer.setdefault(tab_id, []).append(json.dumps({
+            'method': method,
+            'params': params,
+        }))
+        log.info(f'broadcast_cdp_event: tab={tab_id} method={method} — BUFFERED (no session yet, total buffered={len(state.event_buffer[tab_id])})')
         return
     log.info(f'broadcast_cdp_event: tab={tab_id} method={method} → forwarding to {len(sids)} session(s)')
 
