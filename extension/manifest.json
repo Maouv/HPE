@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "HPE — Hermes Playwright Extension",
+  "version": "0.1.0",
+  "description": "Bridge extension that exposes chrome.debugger as CDP endpoint for Playwright connect_over_cdp",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "HPE Bridge"
+  }
+}
