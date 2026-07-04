@@ -71,6 +71,19 @@ class GatewayState:
         # Playwright CDP sessions: tabId → set of client websockets
         self.cdp_clients: Dict[int, set[WebSocket]] = {}
 
+        # tabId → real Chromium main-frame id (from Page.getFrameTree).
+        # CRITICAL: Playwright's CRPage keys its internal session map by
+        # `targetId` (from Target.attachedToTarget) but looks up sessions by
+        # `frame._id` (from Page.getFrameTree) when routing Page.navigate.
+        # Real Chrome guarantees targetId === main frame id; our bridge must
+        # replicate that by using the REAL frame id as targetId everywhere,
+        # not the internal chrome tab id. Otherwise every goto() fails
+        # instantly with "Frame has been detached" (session lookup by the
+        # real frame id never finds an entry, since it was registered under
+        # the tab id instead). See get_real_frame_id().
+        self.tab_frame_ids: Dict[int, str] = {}
+        self.frame_id_to_tab: Dict[str, int] = {}
+
         # Request ID counter
         self._next_id = 1
 
@@ -81,6 +94,45 @@ class GatewayState:
 
 
 state = GatewayState()
+
+
+async def get_real_frame_id(tab_id: int, timeout: float = 10.0) -> str:
+    """Resolve the REAL Chromium main-frame id for a tab via Page.getFrameTree.
+
+    Falls back to str(tab_id) on failure (logged loudly) — that reproduces
+    the original bug in the degraded case, but keeps the gateway from hard
+    crashing if a tab is somehow unreachable.
+    """
+    cached = state.tab_frame_ids.get(tab_id)
+    if cached:
+        return cached
+
+    if not state.extension_ws:
+        log.warning(f'[FrameID] no extension_ws, falling back to tab_id for tab={tab_id}')
+        return str(tab_id)
+
+    rid = state.next_id()
+    future = asyncio.get_event_loop().create_future()
+    state.pending_cdp[rid] = future
+    try:
+        await state.extension_ws.send_json({
+            'type': 'cdp_command',
+            'id': rid,
+            'method': 'Page.getFrameTree',
+            'params': {},
+            'tabId': tab_id,
+        })
+        result = await asyncio.wait_for(future, timeout=timeout)
+        frame_id = result['frameTree']['frame']['id']
+        state.tab_frame_ids[tab_id] = frame_id
+        state.frame_id_to_tab[frame_id] = tab_id
+        log.info(f'[FrameID] resolved real frame id for tab={tab_id}: {frame_id}')
+        return frame_id
+    except Exception as e:
+        state.pending_cdp.pop(rid, None)
+        log.warning(f'[FrameID] failed to resolve real frame id for tab={tab_id}: {e} — falling back to tab_id (this WILL reproduce "Frame has been detached")')
+        return str(tab_id)
+
 
 # ─── FastAPI App ─────────────────────────────────────────────────────────────
 
@@ -321,6 +373,17 @@ async def handle_extension_message(msg: dict):
         tab_id = msg.get('tabId')
         method = msg.get('method')
         params = msg.get('params', {})
+        if method in ('Page.frameDetached', 'Page.frameNavigated', 'Page.frameAttached',
+                      'Page.navigatedWithinDocument', 'Inspector.detached',
+                      'Inspector.targetCrashed'):
+            # These are the events that decide whether Playwright thinks the
+            # frame/page died mid-navigation. Log params in full — for
+            # Page.frameDetached specifically, the 'reason' field ('swap' vs
+            # anything else) is the difference between Playwright tolerating
+            # it and Playwright throwing "Frame has been detached."
+            log.info(f'[EVENT-DETAIL] tab={tab_id} method={method} params={json.dumps(params)}')
+        else:
+            log.info(f'cdp_event RECEIVED from extension: tab={tab_id} method={method}')
         await broadcast_cdp_event(tab_id, method, params)
         return
 
@@ -471,11 +534,12 @@ async def browser_cdp_websocket(ws: WebSocket):
         tab_url = tab.get('url', '')
         if tab_url.startswith(SKIP_PREFIXES):
             continue
+        real_id = await get_real_frame_id(tab['id'])
         await ws.send_text(json.dumps({
             'method': 'Target.targetCreated',
             'params': {
                 'targetInfo': {
-                    'targetId': str(tab['id']),
+                    'targetId': real_id,
                     'type': 'page',
                     'title': tab.get('title', ''),
                     'url': tab.get('url', ''),
@@ -563,6 +627,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                             fi = sess.get('frame_info', {})
                             fid = fi.get('id', '1')
                             origin = fi.get('url', 'about:blank')
+                            sess['ctx_counter'] = 1  # track fake context ids per session
                             await asyncio.sleep(0.05)
                             await ws.send_text(json.dumps({
                                 'method': 'Runtime.executionContextCreated',
@@ -579,7 +644,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                                 },
                                 'sessionId': session_id,
                             }))
-                            log.info(f'Synthetic executionContextCreated: frame={fid}')
+                            log.info(f'[SYNTH] executionContextCreated (init): frame={fid} ctx=1')
 
                         elif method == 'Page.setLifecycleEventsEnabled':
                             fi = sess.get('frame_info', {})
@@ -598,7 +663,87 @@ async def browser_cdp_websocket(ws: WebSocket):
                                     },
                                     'sessionId': session_id,
                                 }))
-                            log.info(f'Synthetic lifecycleEvent: frame={fid} loader={lid}')
+                            log.info(f'[SYNTH] lifecycleEvent (init): frame={fid} loader={lid}')
+
+                        # ── NEW: hook real navigations, not just init ──
+                        # Without this, page.goto() called *after* connect (i.e. every
+                        # actual use of this tool, see test_goto.py step 5) still hangs:
+                        # the init hooks above only fire once, at attach time. A real
+                        # Page.navigate has its own new loaderId/frameId and Playwright
+                        # waits on lifecycle/frameNavigated events keyed to THAT loaderId,
+                        # which nothing was synthesizing before this patch.
+                        #
+                        # CAVEAT (unresolved): executionContextId below is still a fake,
+                        # locally-incrementing counter, NOT a real V8 context id from
+                        # Chromium. If Runtime.evaluate/callFunctionOn is later sent by
+                        # Playwright using this fake id, chrome.debugger.sendCommand will
+                        # forward it verbatim to the real backend, which will very likely
+                        # reject it ("Cannot find context with specified id"). This patch
+                        # does NOT fix page.evaluate() / set_content() (test_goto.py steps
+                        # 7-10) — only unblocks goto()'s navigation-wait. Expect step 5 to
+                        # pass and steps 7/9 to still fail unless real onEvent turns out to
+                        # fire after all (check logs for "cdp_event RECEIVED from extension"
+                        # — if that line NEVER appears during this run, onEvent is
+                        # confirmed dead on this platform, not just slow).
+                        elif method == 'Page.navigate' and result:
+                            fid = result.get('frameId') or sess.get('frame_info', {}).get('id', '1')
+                            lid = result.get('loaderId', '1')
+                            nav_url = params.get('url', '')
+                            nav_error = result.get('errorText')
+
+                            sess['frame_info'] = {'id': fid, 'url': nav_url, 'loaderId': lid}
+                            sess['ctx_counter'] = sess.get('ctx_counter', 1) + 1
+                            new_ctx_id = sess['ctx_counter']
+                            ts = time.time()
+
+                            if nav_error:
+                                # Navigation itself failed at the CDP level — don't
+                                # synthesize a fake success, that would desync Playwright
+                                # further. Let the real error surface via the command result.
+                                log.warning(f'[SYNTH] Page.navigate returned errorText={nav_error}, skipping synthetic events for frame={fid}')
+                            else:
+                                await asyncio.sleep(0.05)
+                                await ws.send_text(json.dumps({
+                                    'method': 'Page.frameNavigated',
+                                    'params': {
+                                        'frame': {
+                                            'id': fid,
+                                            'loaderId': lid,
+                                            'url': nav_url,
+                                            'securityOrigin': nav_url,
+                                            'mimeType': 'text/html',
+                                        },
+                                        'type': 'Navigation',
+                                    },
+                                    'sessionId': session_id,
+                                }))
+                                await ws.send_text(json.dumps({
+                                    'method': 'Runtime.executionContextCreated',
+                                    'params': {
+                                        'context': {
+                                            'id': new_ctx_id,
+                                            'origin': nav_url,
+                                            'name': '',
+                                            'auxData': {
+                                                'frameId': fid,
+                                                'isDefault': True,
+                                            },
+                                        }
+                                    },
+                                    'sessionId': session_id,
+                                }))
+                                for evt in ('DOMContentLoaded', 'load'):
+                                    await ws.send_text(json.dumps({
+                                        'method': 'Page.lifecycleEvent',
+                                        'params': {
+                                            'frameId': fid,
+                                            'loaderId': lid,
+                                            'name': evt,
+                                            'timestamp': ts,
+                                        },
+                                        'sessionId': session_id,
+                                    }))
+                                log.info(f'[SYNTH] frameNavigated+context+lifecycle for real Page.navigate: frame={fid} loader={lid} ctx={new_ctx_id} url={nav_url[:80]}')
 
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
@@ -658,34 +803,79 @@ async def browser_cdp_websocket(ws: WebSocket):
                 }))
 
             elif method == 'Target.setAutoAttach':
-                # Playwright auto-attach — auto-attach to all debuggable tabs
-                SKIP_PREFIXES = ('content://', 'chrome://', 'chrome-extension://', 'devtools://')
-                for tab in state.tabs:
-                    tab_url = tab.get('url', '')
-                    if tab_url.startswith(SKIP_PREFIXES):
-                        continue
-                    tab_id = tab['id']
-                    sid = f'session-{tab_id}-{state.next_id()}'
-                    state.sessions[sid] = {'tabId': tab_id, 'ws': ws}
-                    if tab_id not in state.tab_sessions:
-                        state.tab_sessions[tab_id] = set()
-                    state.tab_sessions[tab_id].add(sid)
+                # Playwright sends this at TWO levels:
+                #   1. Browser-level (session_id is None) — "discover top-level pages"
+                #   2. Page-level (session_id is a real sessionId) — "discover sub-targets
+                #      (OOPIF/worker) INSIDE that specific page session"
+                #
+                # BUG (fixed here): the old code treated every call identically and
+                # re-looped over ALL tabs + minted a brand-new sessionId + re-sent
+                # Target.attachedToTarget EVERY time, regardless of which level the
+                # call came from. Since Playwright sends this 1x browser-level + 1x
+                # per attached page, a session with N pages got N+1 total calls, and
+                # each pre-existing tab ended up with N+1 *different* sessionIds all
+                # live in tab_sessions[tab_id] simultaneously.
+                #
+                # Consequences that were observed:
+                #   - broadcast_cdp_event() fans a single real CDP event out to every
+                #     sessionId in tab_sessions[tab_id] → one real event got sent
+                #     N+1 times (this is why executionContextCreated appeared ~10x —
+                #     it's fan-out from duplicate sessions, not Chromium re-firing).
+                #   - Playwright, seeing a SECOND Target.attachedToTarget for a
+                #     targetId it already has an active session for, treats the
+                #     earlier session's frame as superseded → "Frame has been
+                #     detached" on the next navigation.
+                #
+                # Fix: only mint a new session for a tab that doesn't already have
+                # one. Page-level calls (session_id is not None) don't re-declare
+                # top-level tabs at all — this bridge has no OOPIF/worker discovery
+                # to offer, so just ack.
+                if session_id is None:
+                    SKIP_PREFIXES = ('content://', 'chrome://', 'chrome-extension://', 'devtools://')
+                    for tab in state.tabs:
+                        tab_url = tab.get('url', '')
+                        if tab_url.startswith(SKIP_PREFIXES):
+                            continue
+                        tab_id = tab['id']
 
-                    await ws.send_text(json.dumps({
-                        'method': 'Target.attachedToTarget',
-                        'params': {
-                            'sessionId': sid,
-                            'targetInfo': {
-                                'targetId': str(tab_id),
-                                'type': 'page',
-                                'title': tab.get('title', ''),
-                                'url': tab.get('url', ''),
-                                'attached': True,
-                                'browserId': 'HPE-Bridge',
-                                'browserContextId': 'default',
-                            },
-                        }
-                    }))
+                        if state.tab_sessions.get(tab_id):
+                            log.info(f'[AutoAttach] tab={tab_id} already has session(s) {state.tab_sessions[tab_id]} — skipping duplicate attach')
+                            continue
+
+                        sid = f'session-{tab_id}-{state.next_id()}'
+                        state.sessions[sid] = {'tabId': tab_id, 'ws': ws}
+                        state.tab_sessions.setdefault(tab_id, set()).add(sid)
+
+                        # CRITICAL: targetId must be the REAL Chromium frame id,
+                        # not our internal tab_id. See get_real_frame_id() docstring —
+                        # CRPage keys its session map by this targetId, but looks
+                        # sessions up later by frame._id when routing Page.navigate.
+                        # If they don't match, goto() throws "Frame has been
+                        # detached." instantly, every single time, with zero wire
+                        # traffic (this was the actual root cause behind that error
+                        # in every prior test run, independent of the duplicate-
+                        # session bug fixed above).
+                        real_id = await get_real_frame_id(tab_id)
+
+                        await ws.send_text(json.dumps({
+                            'method': 'Target.attachedToTarget',
+                            'params': {
+                                'sessionId': sid,
+                                'targetInfo': {
+                                    'targetId': real_id,
+                                    'type': 'page',
+                                    'title': tab.get('title', ''),
+                                    'url': tab.get('url', ''),
+                                    'attached': True,
+                                    'browserId': 'HPE-Bridge',
+                                    'browserContextId': 'default',
+                                },
+                            }
+                        }))
+                        log.info(f'[AutoAttach] new session={sid} for tab={tab_id} (browser-level)')
+                else:
+                    # Page-level auto-attach for sub-targets — nothing to discover.
+                    log.info(f'[AutoAttach] page-level call in session={session_id}, no sub-targets to attach — ack only')
 
                 # Acknowledge
                 await ws.send_text(json.dumps({
@@ -719,8 +909,9 @@ async def browser_cdp_websocket(ws: WebSocket):
             elif method == 'Target.getTargets':
                 targets = []
                 for tab in state.tabs:
+                    real_id = await get_real_frame_id(tab['id'])
                     targets.append({
-                        'targetId': str(tab['id']),
+                        'targetId': real_id,
                         'type': 'page',
                         'title': tab.get('title', ''),
                         'url': tab.get('url', ''),
@@ -734,12 +925,20 @@ async def browser_cdp_websocket(ws: WebSocket):
                 }))
 
             elif method == 'Target.attachToTarget':
-                # Attach to specific target — return sessionId
+                # Attach to specific target — return sessionId.
+                # target_id here is whatever WE previously told Playwright as
+                # 'targetId' (the real frame id, per the fix above) — NOT
+                # necessarily our internal tab_id. Resolve via the reverse map
+                # first; only fall back to treating it as a raw tab_id for
+                # backward compat with any internal caller that still passes one.
                 target_id = params.get('targetId')
-                try:
-                    tid = int(target_id)
-                except (ValueError, TypeError):
-                    tid = target_id
+                tid = state.frame_id_to_tab.get(target_id)
+                if tid is None:
+                    try:
+                        tid = int(target_id)
+                    except (ValueError, TypeError):
+                        tid = target_id
+                    log.warning(f'[attachToTarget] targetId={target_id} not found in frame_id_to_tab map, falling back to raw value as tab_id={tid}')
 
                 sid = f'session-{tid}-{state.next_id()}'
                 state.sessions[sid] = {'tabId': tid, 'ws': ws}
@@ -770,12 +969,16 @@ async def browser_cdp_websocket(ws: WebSocket):
                         tab = result['tab']
                         tid = tab['id']
 
+                        # Resolve the real frame id for this brand-new tab BEFORE
+                        # telling Playwright about it — same fix as setAutoAttach.
+                        real_id = await get_real_frame_id(tid)
+
                         # Send targetCreated event
                         await ws.send_text(json.dumps({
                             'method': 'Target.targetCreated',
                             'params': {
                                 'targetInfo': {
-                                    'targetId': str(tid),
+                                    'targetId': real_id,
                                     'type': 'page',
                                     'title': tab.get('title', ''),
                                     'url': tab.get('url', url),
@@ -798,7 +1001,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                             'params': {
                                 'sessionId': sid,
                                 'targetInfo': {
-                                    'targetId': str(tid),
+                                    'targetId': real_id,
                                     'type': 'page',
                                     'title': tab.get('title', ''),
                                     'url': tab.get('url', url),
@@ -812,7 +1015,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                         # Send response
                         await ws.send_text(json.dumps({
                             'id': cdp_id,
-                            'result': {'targetId': str(tid)},
+                            'result': {'targetId': real_id},
                         }))
                     except asyncio.TimeoutError:
                         await ws.send_text(json.dumps({
@@ -827,8 +1030,13 @@ async def browser_cdp_websocket(ws: WebSocket):
 
             elif method == 'Target.closeTarget':
                 target_id = params.get('targetId')
-                try:
-                    tid = int(target_id)
+                tid = state.frame_id_to_tab.get(target_id)
+                if tid is None:
+                    try:
+                        tid = int(target_id)
+                    except (ValueError, TypeError):
+                        tid = None
+                if tid is not None:
                     rid = state.next_id()
                     future = asyncio.get_event_loop().create_future()
                     state.pending_requests[rid] = future
@@ -848,7 +1056,7 @@ async def browser_cdp_websocket(ws: WebSocket):
                         'id': cdp_id,
                         'result': {},
                     }))
-                except (ValueError, TypeError):
+                else:
                     await ws.send_text(json.dumps({
                         'id': cdp_id,
                         'error': {'message': 'Invalid target ID'},
@@ -886,7 +1094,9 @@ async def broadcast_cdp_event(tab_id: int, method: str, params: dict):
     # Route via sessions
     sids = state.tab_sessions.get(tab_id, set())
     if not sids:
+        log.warning(f'broadcast_cdp_event: tab={tab_id} method={method} — NO session mapped, DROPPED. known tab_sessions keys={list(state.tab_sessions.keys())}')
         return
+    log.info(f'broadcast_cdp_event: tab={tab_id} method={method} → forwarding to {len(sids)} session(s)')
 
     dead = []
     for sid in list(sids):
